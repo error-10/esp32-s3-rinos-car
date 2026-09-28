@@ -1,4 +1,5 @@
 # RinOS-Car: ESP32-S3 智能圆形车载液晶仪表盘系统
+注意：目前只支持蚂蚁保护板！！！
 
 <div align="center">
 
