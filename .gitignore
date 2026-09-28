@@ -1,0 +1,14 @@
+# PlatformIO local cache & build files
+.pio/
+.vscode/
+
+# Build artifacts
+*.elf
+*.bin
+*.hex
+*.o
+*.d
+
+# OS generated files
+.DS_Store
+Thumbs.db
