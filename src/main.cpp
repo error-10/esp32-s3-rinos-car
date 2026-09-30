@@ -141,8 +141,13 @@ enum KeyEvent {
     KEY_EVENT_K4,      // 向下 / 切换上半区模式
     KEY_EVENT_K2,      // 确认 / 桌面唤起功能菜单
     KEY_EVENT_K3,      // 全局返回 / 退出
-    KEY_EVENT_K2_LONG  // K2 长按 1.8 秒：重新进入蓝牙配对向导
+    KEY_EVENT_K2_LONG, // K2 长按 1.8 秒：重新进入蓝牙配对向导
+    KEY_EVENT_K3_LONG  // K3 长按 5.0 秒：全局卡死紧急强行重启
 };
+
+// 全局实时按键 ADC 调试监控变量 (供屏幕与串口实时校准显示)
+volatile uint32_t g_lastRawKeyAdc = 0;
+volatile uint8_t g_currentDetectedKey = 0;
 
 KeyEvent scanKeypad() {
     static uint32_t pressStartTime = 0;
@@ -171,17 +176,33 @@ KeyEvent scanKeypad() {
     }
     uint32_t raw = sum / 8;
 
+    g_lastRawKeyAdc = raw;
+
     uint8_t currentKey = 0;
-    if (raw < 600) {
-        currentKey = 0;
-    } else if (raw < 1550) {
-        currentKey = 1; // K1
-    } else if (raw < 2350) {
-        currentKey = 2; // K2
-    } else if (raw < 3350) {
-        currentKey = 3; // K3
+    if (raw < 1200) {
+        currentKey = 0; // 没按 (实测 770，阈值 1200 留足 430 裕度)
+    } else if (raw < 2050) {
+        currentKey = 1; // K1 (实测 1675，中间值 2050)
+    } else if (raw < 2800) {
+        currentKey = 2; // K2 (实测 2405，中间值 2800)
+    } else if (raw < 3650) {
+        currentKey = 3; // K3 (实测 3200，中间值 3650)
     } else {
-        currentKey = 4; // K4
+        currentKey = 4; // K4 (实测 4095)
+    }
+
+    g_currentDetectedKey = currentKey;
+
+    // 实时串口校准日志输出：发生按键变化或每 400ms 打印一次当前实时 ADC 采样值
+    static uint32_t s_lastLogTime = 0;
+    static uint32_t s_lastLoggedRaw = 0;
+    static uint8_t s_lastLoggedKey = 255;
+    if ((millis() - s_lastLogTime >= 400) || (currentKey != s_lastLoggedKey) || (abs((int)raw - (int)s_lastLoggedRaw) > 150)) {
+        s_lastLogTime = millis();
+        s_lastLoggedRaw = raw;
+        s_lastLoggedKey = currentKey;
+        Serial.printf("[KEY CALIB] ADC Raw: %4u | Volts: %1.2fV | Mapped: K%d | Pressing: %s\n",
+                      raw, (float)raw * 3.3f / 4095.0f, currentKey, isPressing ? "YES" : "NO");
     }
 
     if (currentKey != 0) {
@@ -191,10 +212,16 @@ KeyEvent scanKeypad() {
             activeKey = currentKey;
             pressStartTime = millis();
             longTriggered = false;
+            Serial.printf(">>> [KEY DOWN] K%d 按下 (Raw: %u)\n", currentKey, raw);
         } else {
             if (activeKey == 2 && !longTriggered && (millis() - pressStartTime >= 1800)) {
                 longTriggered = true;
+                Serial.println(">>> [KEY LONG] K2 长按 1.8s 触发！重新进入配对向导");
                 return KEY_EVENT_K2_LONG;
+            } else if (activeKey == 3 && !longTriggered && (millis() - pressStartTime >= 5000)) {
+                longTriggered = true;
+                Serial.println(">>> [EMERGENCY] K3 长按 5s 触发！全局卡死准备重启系统");
+                return KEY_EVENT_K3_LONG;
             }
         }
     } else {
@@ -203,6 +230,7 @@ KeyEvent scanKeypad() {
             if (releaseCounter >= 2) {
                 isPressing = false;
                 uint32_t duration = millis() - pressStartTime;
+                Serial.printf("<<< [KEY UP] K%d 松开 (持续 %u ms)\n", activeKey, duration);
                 if (!longTriggered && duration >= 25) {
                     switch (activeKey) {
                         case 1: return KEY_EVENT_K1;
@@ -228,7 +256,9 @@ enum SystemState {
     STATE_PANEL_CLEAR_MONTH,  // 清除本月大计确认
     STATE_PANEL_BATTERY,      // 电池参数详情面板
     STATE_PANEL_GPS,          // GPS 参数详情面板
-    STATE_PANEL_ABOUT         // 关于系统面板
+    STATE_PANEL_ABOUT,        // 关于系统面板
+    STATE_BMS_RELEASED,       // 释放保护板蓝牙给手机 App 连接
+    STATE_SCREEN_OFF          // 息屏待机状态 (关闭屏幕显示)
 };
 
 SystemState currentState = STATE_BOOT_ANIM;
@@ -434,13 +464,15 @@ uint32_t bottomSubAnimStart = 0;
 
 // 功能菜单项光标与选项
 int menuCursor = 0;
-const int MENU_TOTAL_ITEMS = 5;
+const int MENU_TOTAL_ITEMS = 7;
 const char* MENU_ITEMS[MENU_TOTAL_ITEMS] = {
-    "1. 清除本月大计",
-    "2. 重新连接保护板",
-    "3. 电池面板",
-    "4. GPS 参数面板",
-    "5. 关于系统"
+    "1. 释放保护板蓝牙",
+    "2. 清除本月大计",
+    "3. 关闭屏幕显示",
+    "4. 重新配对保护板",
+    "5. 电池遥测监控",
+    "6. GPS 卫星遥测",
+    "7. 关于车机系统"
 };
 
 // 清除确认光标 (0=取消, 1=确认清零)
@@ -825,7 +857,16 @@ void drawDeviceListUI(const char* title) {
     canvas.setFont(&fonts::FreeSans9pt7b);
     canvas.setTextDatum(top_center);
     canvas.setTextColor(0x52AA);
-    canvas.drawString("K1:^  K4:v  K2:OK  K3:Back", 120, 212);
+    canvas.drawString("K1:^  K4:v  K2:OK  K3:Back", 120, 210);
+
+    // 实时按键 ADC 调试数据 OSD (方便肉眼直观查看各键采样值)
+    char adcOsd[32];
+    snprintf(adcOsd, sizeof(adcOsd), "ADC:%u [K%d]", g_lastRawKeyAdc, g_currentDetectedKey);
+    canvas.setFont(&fonts::Font0);
+    canvas.setTextDatum(top_center);
+    canvas.setTextColor(0x7BEF);
+    canvas.drawString(adcOsd, 120, 228);
+
     canvas.pushSprite(0, 0);
 }
 
@@ -1277,6 +1318,7 @@ void parseNmeaSentence(const char* sentence) {
             // 非有效定位状态 ('V' 或尚未定位空包)
             gpsData.isFix = false;
             gpsData.speedKmH = 0.0f;
+            memset(s_win, 0, sizeof(s_win));  // 清空滑动窗口，防止重新定位后残留旧速度导致跳变
             s_filteredSpeed = 0.0f;
             carData.speed = 0.0f;
         }
@@ -1359,8 +1401,12 @@ void parseNmeaSentence(const char* sentence) {
         static int s_cycleMaxSnr = 0;
         static int s_cycleTracked = 0;
 
-        // 每隔 1200ms (即一个完整 NMEA 输出周期) 结算上一周期的最高信噪比与有效信号星数
-        if (millis() - s_lastGsvCycle >= 1200) {
+        // 新周期检测：收到任意星座的第 1 分包 (sentence number == '1')
+        // 且距上次重置 ≥ 500ms 时，认为新一轮 GSV 报告开始
+        // 提交上一轮结果并重置累加器
+        // 500ms 保护窗口：同一轮内 GPGSV#1 与 BDGSV#1 间隔通常 < 100ms，不会误触发
+        // 旧方案 1200ms 定时器 > 1Hz 输出周期 (1000ms)，导致两轮数据叠加到同一累加器
+        if (tokens[2][0] == '1' && (millis() - s_lastGsvCycle >= 500)) {
             gpsData.maxSnr = s_cycleMaxSnr;
             gpsData.trackedWithSnr = s_cycleTracked;
             s_cycleMaxSnr = 0;
@@ -1382,12 +1428,6 @@ void parseNmeaSentence(const char* sentence) {
                     }
                 }
             }
-        }
-        if (s_cycleMaxSnr > gpsData.maxSnr) {
-            gpsData.maxSnr = s_cycleMaxSnr;
-        }
-        if (s_cycleTracked > gpsData.trackedWithSnr) {
-            gpsData.trackedWithSnr = s_cycleTracked;
         }
     }
 }
@@ -1489,6 +1529,8 @@ void updateGps() {
 }
 
 // ================= 动能回收硬拦截与真实充电状态滤波 =================
+bool g_manualExitCharging = false;
+
 bool isBmsChargingCurrent() {
     if (!carData.isLiveBms) return false;
     // 双重硬核校验：
@@ -1502,24 +1544,62 @@ void checkChargingStateTransitions() {
     static uint32_t chargeCandidateStart = 0;
     static uint32_t dischargeCandidateStart = 0;
 
-    // 1. 动能回收与行驶硬拦截：车速 > 0.5 km/h 坚决禁止进入独占充电大屏！
+    // 息屏待机模式下不主动弹屏打扰，保持关闭直到用户按任意键唤醒
+    if (currentState == STATE_SCREEN_OFF) {
+        return;
+    }
+
+    // 1. 动能回收与骑行硬拦截 (第一道防线)：车速 > 0.5 km/h 坚决禁止进入独占充电大屏！
     if (carData.speed > 0.5f) {
         chargeCandidateStart = 0;
+        dischargeCandidateStart = 0;
+        g_manualExitCharging = false; // 正在骑行，解除手动退出锁定
         if (currentState == STATE_CHARGING_DASH) {
             currentState = STATE_DASHBOARD_MAIN;
         }
         return;
     }
 
-    // 2. 车辆静止下检测保护板充电标志与充入电流
+    // 2. 拧电门放电硬拦截 (第二道防线，0延迟)：只要电流为放电 (正数 > 0.5A)，瞬间强制退出充电大屏！
+    // 真实插枪充电时电池绝对不可能处于大电流放电状态！一旦放电说明在骑行拧油门，绝不误跳！
+    if (carData.isLiveBms && carData.currentA > 0.5f) {
+        chargeCandidateStart = 0;
+        dischargeCandidateStart = 0;
+        g_manualExitCharging = false; // 拧油门放电，解除手动退出锁定
+        if (currentState == STATE_CHARGING_DASH) {
+            Serial.println("[CHG] 检测到放电电流 (拧油门中)！0延迟立即强制退出充电大屏！");
+            currentState = STATE_DASHBOARD_MAIN;
+        }
+        return;
+    }
+
+    // 3. 用户手动退出锁定检查：若用户在充电大屏按键退出了，只要未拔掉充电枪，绝不自动弹回
+    if (g_manualExitCharging) {
+        chargeCandidateStart = 0;
+        // 当物理充入电流完全消失持续 3 秒以上（拔枪），重置锁定状态
+        if (!isBmsChargingCurrent()) {
+            if (dischargeCandidateStart == 0) {
+                dischargeCandidateStart = millis();
+            } else if (millis() - dischargeCandidateStart >= 3000) {
+                g_manualExitCharging = false;
+                dischargeCandidateStart = 0;
+                Serial.println("[CHG] 物理充电电流消失 (已拔枪)，解除手动退出锁定");
+            }
+        } else {
+            dischargeCandidateStart = 0;
+        }
+        return;
+    }
+
+    // 4. 车辆静止下检测保护板充电标志与充入电流
     if (isBmsChargingCurrent()) {
         dischargeCandidateStart = 0;
         if (chargeCandidateStart == 0) {
             chargeCandidateStart = millis();
-        } else if (millis() - chargeCandidateStart >= 2000) {
-            // 静止且保护板指示充电持续 2 秒：确认为真实插枪充电！
+        } else if (millis() - chargeCandidateStart >= 3500) {
+            // 静止且保护板指示充电持续 3.5 秒以上：确认为真实插枪充电 (彻底过滤动能回收滑行)！
             if (currentState == STATE_DASHBOARD_MAIN) {
-                Serial.println("[CHG] 保护板确认插枪充电！切换至独占全屏充电动画");
+                Serial.println("[CHG] 保护板确认插枪充电 (持续稳定3.5s)！切换至独占全屏充电动画");
                 currentState = STATE_CHARGING_DASH;
                 chargeEnterTime = millis();
             }
@@ -1533,6 +1613,42 @@ void checkChargingStateTransitions() {
                 Serial.println("[CHG] 退出充电模式 / 拔掉充电枪，恢复主仪表盘");
                 currentState = STATE_DASHBOARD_MAIN;
             }
+        }
+    }
+}
+
+// ================= 全局保护板定时轮询与掉线守护 =================
+// 在主仪表盘、充电大屏、功能菜单、参数详情等所有工作状态下均保持后台数据刷新
+void updateBmsPolling() {
+    // 释放蓝牙模式、配对向导、息屏待机中，严禁发起轮询或自动回连
+    // STATE_SCREEN_OFF: connectToBms() 内部会调用 drawDeviceListUI() 刷屏，会意外唤醒屏幕，必须跳过
+    if (currentState == STATE_WIZARD_BMS || currentState == STATE_CONNECTING_BMS ||
+        currentState == STATE_BMS_RELEASED || currentState == STATE_SCREEN_OFF) {
+        return;
+    }
+
+    // 保护板主动定时轮询 (每 1000ms 一次，兼顾新旧双协议)
+    if (pBmsClient && pBmsClient->isConnected()) {
+        static uint32_t lastBmsPoll = 0;
+        if (millis() - lastBmsPoll >= 1000) {
+            lastBmsPoll = millis();
+            if (pBmsTxChar && (pBmsTxChar->canWrite() || pBmsTxChar->canWriteNoResponse())) {
+                const uint8_t antQueryNew[10] = { 0x7E, 0xA1, 0x01, 0x00, 0x00, 0xBE, 0x18, 0x55, 0xAA, 0x55 };
+                pBmsTxChar->writeValue(antQueryNew, sizeof(antQueryNew), false);
+
+                const uint8_t antQueryOld[6] = { 0xDB, 0xDB, 0x00, 0x00, 0x00, 0x00 };
+                pBmsTxChar->writeValue(antQueryOld, sizeof(antQueryOld), false);
+            }
+        }
+    } else if (pBmsClient && !pBmsClient->isConnected() && !pairedBmsMac.isEmpty()) {
+        // 掉线自动回连守护 (每 4 秒)
+        static uint32_t lastBmsReconnect = 0;
+        if (millis() - lastBmsReconnect >= 4000) {
+            lastBmsReconnect = millis();
+            BleDeviceItem bmsDev;
+            bmsDev.name = pairedBmsName.c_str();
+            bmsDev.address = NimBLEAddress(pairedBmsMac.c_str());
+            connectToBms(bmsDev);
         }
     }
 }
@@ -1942,6 +2058,14 @@ void drawMainDashboardUI(float overrideSpeed = -1.0f, float overrideSoc = -1.0f,
         }
     }
 
+    // 底部按键校准实时 HUD (微缩字，实时监视 GPIO 8 采样读数与键值)
+    char adcOsd[32];
+    snprintf(adcOsd, sizeof(adcOsd), "ADC:%u [K%d]", g_lastRawKeyAdc, g_currentDetectedKey);
+    canvas.setFont(&fonts::Font0);
+    canvas.setTextDatum(bottom_center);
+    canvas.setTextColor(0x7BEF);
+    canvas.drawString(adcOsd, 120, 238);
+
     canvas.pushSprite(0, 0);
 }
 
@@ -2190,7 +2314,7 @@ void drawChargingUI() {
     canvas.pushSprite(0, 0);
 }
 
-// ================= 功能菜单 UI (卡片入场交错滑入 + 光标阻尼丝滑平移) =================
+// ================= 功能菜单 UI (4项视口平滑滚动 + 科技机能风) =================
 void drawMenuUI() {
     canvas.fillSprite(COLOR_BG);
     canvas.drawCircle(120, 120, 119, 0x18C3);
@@ -2202,65 +2326,52 @@ void drawMenuUI() {
     canvas.drawString("功能设置", 120, 12);
     canvas.drawFastHLine(50, 40, 140, 0x2945);
 
-    const int16_t startY = 46, cardH = 28, gap = 4, cardW = 184;
-    const int16_t cardX = 120 - cardW / 2;
+    const int16_t startY = 48, cardH = 32, gap = 5, cardW = 176;
+    const int16_t cardX = 118 - cardW / 2;
+    const int VISIBLE_ITEMS = 4;
 
-    // 动效 3：菜单入场交错滑入 (前 320ms)
-    uint32_t menuElapsed = millis() - menuEnterTime;
-    const uint32_t MENU_ANIM_DUR = 320;
-    float menuProgress = (menuElapsed < MENU_ANIM_DUR) ? ((float)menuElapsed / (float)MENU_ANIM_DUR) : 1.0f;
-
-    // 动效 4：光标阻尼平滑逼近 (物理弹簧插值 Lerp)
-    static float cursorCurrentY = 46.0f;
-    float cursorTargetY = startY + menuCursor * (cardH + gap);
-    if (menuElapsed < 30 && menuCursor == 0) {
-        cursorCurrentY = cursorTargetY;
-    } else {
-        cursorCurrentY += (cursorTargetY - cursorCurrentY) * 0.35f;
-    }
-    int16_t renderCursorY = (int16_t)(cursorCurrentY + 0.5f);
-
-    // 先画所有普通底卡片 (带交错横向滑入)
-    for (int i = 0; i < MENU_TOTAL_ITEMS; i++) {
-        int16_t y = startY + i * (cardH + gap);
-        float itemDelay = i * 0.08f;
-        float itemP = (menuProgress - itemDelay) / (1.0f - itemDelay);
-        if (itemP < 0.0f) itemP = 0.0f;
-        if (itemP > 1.0f) itemP = 1.0f;
-        float ease = easeOutCubic(itemP);
-        int16_t slideX = cardX + (int16_t)((1.0f - ease) * (i % 2 == 0 ? -30.0f : 30.0f));
-
-        canvas.fillRoundRect(slideX, y, cardW, cardH, 5, COLOR_CARD_NORMAL);
+    // 动态滚动视口计算
+    static int menuScrollOffset = 0;
+    if (menuCursor < menuScrollOffset) {
+        menuScrollOffset = menuCursor;
+    } else if (menuCursor >= menuScrollOffset + VISIBLE_ITEMS) {
+        menuScrollOffset = menuCursor - VISIBLE_ITEMS + 1;
     }
 
-    // 绘制高亮浮动光标 (物理丝滑跟随)
-    if (menuProgress >= 0.5f) {
-        canvas.fillRoundRect(cardX, renderCursorY, cardW, cardH, 5, COLOR_CARD_SELECT);
-        canvas.drawRoundRect(cardX, renderCursorY, cardW, cardH, 5, COLOR_CYAN_ACCENT);
-        canvas.fillRoundRect(cardX + 2, renderCursorY + 4, 3, cardH - 8, 2, COLOR_CYAN_ACCENT);
-    }
+    // 绘制 4 项视口卡片
+    for (int slot = 0; slot < VISIBLE_ITEMS; slot++) {
+        int idx = menuScrollOffset + slot;
+        if (idx >= MENU_TOTAL_ITEMS) break;
 
-    // 绘制卡片文字
-    for (int i = 0; i < MENU_TOTAL_ITEMS; i++) {
-        int16_t y = startY + i * (cardH + gap);
-        float itemDelay = i * 0.08f;
-        float itemP = (menuProgress - itemDelay) / (1.0f - itemDelay);
-        if (itemP < 0.0f) itemP = 0.0f;
-        if (itemP > 1.0f) itemP = 1.0f;
-        float ease = easeOutCubic(itemP);
-        int16_t slideX = cardX + (int16_t)((1.0f - ease) * (i % 2 == 0 ? -30.0f : 30.0f));
+        int16_t y = startY + slot * (cardH + gap);
+        bool isSelected = (idx == menuCursor);
 
-        bool isSelected = (i == menuCursor);
+        if (isSelected) {
+            canvas.fillRoundRect(cardX, y, cardW, cardH, 5, COLOR_CARD_SELECT);
+            canvas.drawRoundRect(cardX, y, cardW, cardH, 5, COLOR_CYAN_ACCENT);
+            canvas.fillRoundRect(cardX + 2, y + 4, 3, cardH - 8, 2, COLOR_CYAN_ACCENT);
+            canvas.setTextColor(COLOR_WHITE_TEXT);
+        } else {
+            canvas.fillRoundRect(cardX, y, cardW, cardH, 5, COLOR_CARD_NORMAL);
+            canvas.setTextColor(COLOR_GRAY_TEXT);
+        }
+
         canvas.setFont(&fonts::efontCN_16);
         canvas.setTextDatum(middle_left);
-        canvas.setTextColor(isSelected ? COLOR_WHITE_TEXT : COLOR_GRAY_TEXT);
-        canvas.drawString(MENU_ITEMS[i], slideX + 10, y + cardH / 2);
+        canvas.drawString(MENU_ITEMS[idx], cardX + 12, y + cardH / 2);
+    }
+
+    // 列表右侧滚动微点指示器
+    for (int d = 0; d < MENU_TOTAL_ITEMS; d++) {
+        int16_t dotY = 70 + d * 18;
+        uint16_t dotCol = (d == menuCursor) ? COLOR_CYAN_ACCENT : 0x2945;
+        canvas.fillCircle(215, dotY, (d == menuCursor) ? 3 : 2, dotCol);
     }
 
     canvas.setFont(&fonts::FreeSans9pt7b);
     canvas.setTextDatum(top_center);
     canvas.setTextColor(0x52AA);
-    canvas.drawString("K1:^  K4:v  K2:OK  K3:Back", 120, 212);
+    canvas.drawString("K1:^  K4:v  K2:OK  K3:Back", 120, 214);
     canvas.pushSprite(0, 0);
 }
 
@@ -2595,7 +2706,7 @@ void drawAboutPanelUI() {
     canvas.setTextColor(COLOR_GRAY_TEXT);
     canvas.drawString("固件版本:", leftX, startY);
     canvas.setTextColor(COLOR_CYAN_ACCENT);
-    canvas.drawString("v2.4.0-GPS", leftX + 70, startY);
+    canvas.drawString("v3.0.0", leftX + 70, startY);
 
     // 芯片平台与主频
     canvas.setTextColor(COLOR_GRAY_TEXT);
@@ -2633,6 +2744,69 @@ void drawAboutPanelUI() {
     canvas.setTextColor(0x52AA);
     canvas.drawString("K3: Return", 120, 212);
     canvas.pushSprite(0, 0);
+}
+
+// ================= 保护板蓝牙释放独立界面 =================
+void drawBmsReleasedUI() {
+    canvas.fillSprite(COLOR_BG);
+    canvas.drawCircle(120, 120, 119, COLOR_ARC_TRACK);
+
+    // 外圈科技流光双弧
+    static float ringAngle = 0.0f;
+    ringAngle += 2.5f;
+    if (ringAngle >= 360.0f) ringAngle -= 360.0f;
+    canvas.fillArc(120, 120, 117, 114, ringAngle, ringAngle + 50.0f, COLOR_CYAN_ACCENT);
+    canvas.fillArc(120, 120, 117, 114, ringAngle + 180.0f, ringAngle + 230.0f, COLOR_CYAN_ACCENT);
+
+    // 标题
+    canvas.setFont(&fonts::efontCN_24);
+    canvas.setTextDatum(top_center);
+    canvas.setTextColor(COLOR_CYAN_ACCENT);
+    canvas.drawString("蓝牙已临时释放", 120, 16);
+    canvas.drawFastHLine(45, 44, 150, 0x2945);
+
+    // 状态提示主卡片
+    int16_t cardW = 194, cardH = 96, cardX = 120 - cardW / 2, cardY = 52;
+    canvas.fillRoundRect(cardX, cardY, cardW, cardH, 6, COLOR_CARD_NORMAL);
+    canvas.drawRoundRect(cardX, cardY, cardW, cardH, 6, 0x2945);
+
+    canvas.setFont(&fonts::efontCN_16);
+    canvas.setTextDatum(top_center);
+    canvas.setTextColor(COLOR_GREEN_SIGNAL);
+    canvas.drawString("保护板蓝牙已临时释放", 120, cardY + 12);
+
+    canvas.setTextColor(COLOR_CYAN_ACCENT);
+    canvas.drawString("交给你了~", 120, cardY + 38);
+
+    canvas.setTextColor(COLOR_GRAY_TEXT);
+    canvas.drawString("请打开手机蚂蚁App连接", 120, cardY + 64);
+
+    // 底部恢复提示卡片
+    int16_t bCardW = 176, bCardH = 34, bCardX = 120 - bCardW / 2, bCardY = 158;
+    canvas.fillRoundRect(bCardX, bCardY, bCardW, bCardH, 5, COLOR_CARD_SELECT);
+    canvas.drawRoundRect(bCardX, bCardY, bCardW, bCardH, 5, COLOR_CYAN_ACCENT);
+
+    canvas.setTextColor(COLOR_WHITE_TEXT);
+    canvas.setTextDatum(middle_center);
+    canvas.drawString("按任意按键恢复接管", 120, bCardY + bCardH / 2);
+
+    canvas.setFont(&fonts::FreeSans9pt7b);
+    canvas.setTextColor(0x52AA);
+    canvas.drawString("Press Any Key To Resume", 120, 212);
+
+    canvas.pushSprite(0, 0);
+}
+
+// ================= 息屏与唤醒控制 =================
+void turnScreenOff() {
+    canvas.fillSprite(0x0000);
+    canvas.pushSprite(0, 0);
+    lcd.sleep();
+}
+
+void turnScreenOn() {
+    lcd.wakeup();
+    lcd.setBrightness(255);
 }
 
 // ================= Setup & Loop 主流程 =================
@@ -2711,7 +2885,10 @@ void loop() {
     // 2. 实时非阻塞解析 GPS NMEA 报文与航程积分
     updateGps();
 
-    // 3. 实时检查动能回收过滤与真实插枪充电状态转移
+    // 3. 全局保护板定时轮询与掉线自愈回连守护 (全状态保持数据持续刷新)
+    updateBmsPolling();
+
+    // 4. 实时检查动能回收过滤与真实插枪充电状态转移
     checkChargingStateTransitions();
 
     // K2 长按 1.8 秒：在任意界面强制重新配对保护板
@@ -2727,6 +2904,25 @@ void loop() {
         currentState = STATE_WIZARD_BMS;
         drawDeviceListUI("连接保护板");
         startBleScan();
+        return;
+    }
+
+    // K3 长按 5 秒：全局卡死紧急强制重启
+    if (key == KEY_EVENT_K3_LONG) {
+        Serial.println("[EMERGENCY] K3 长按 5s 触发！全局卡死紧急强制重启系统！");
+        if (carData.monthKm != carData.lastSavedMonthKm) {
+            prefs.putFloat("month_odo", carData.monthKm);
+        }
+        lcd.wakeup();
+        lcd.setBrightness(255);
+        canvas.fillSprite(COLOR_BG);
+        canvas.setFont(&fonts::efontCN_24);
+        canvas.setTextDatum(middle_center);
+        canvas.setTextColor(COLOR_RED_ACCENT);
+        canvas.drawString("系统强行重启...", 120, 120);
+        canvas.pushSprite(0, 0);
+        delay(300);
+        esp_restart();
         return;
     }
 
@@ -2811,30 +3007,13 @@ void loop() {
                 drawMenuUI();
                 break;
             }
-
-            // 保护板主动定时轮询 (每 1000ms 一次，兼顾新旧双协议)
-            if (pBmsClient && pBmsClient->isConnected()) {
-                static uint32_t lastBmsPoll = 0;
-                if (millis() - lastBmsPoll >= 1000) {
-                    lastBmsPoll = millis();
-                    if (pBmsTxChar && (pBmsTxChar->canWrite() || pBmsTxChar->canWriteNoResponse())) {
-                        const uint8_t antQueryNew[10] = { 0x7E, 0xA1, 0x01, 0x00, 0x00, 0xBE, 0x18, 0x55, 0xAA, 0x55 };
-                        pBmsTxChar->writeValue(antQueryNew, sizeof(antQueryNew), false);
-
-                        const uint8_t antQueryOld[6] = { 0xDB, 0xDB, 0x00, 0x00, 0x00, 0x00 };
-                        pBmsTxChar->writeValue(antQueryOld, sizeof(antQueryOld), false);
-                    }
-                }
-            } else if (pBmsClient && !pBmsClient->isConnected() && !pairedBmsMac.isEmpty()) {
-                // 掉线自动回连守护 (每 4 秒)
-                static uint32_t lastBmsReconnect = 0;
-                if (millis() - lastBmsReconnect >= 4000) {
-                    lastBmsReconnect = millis();
-                    BleDeviceItem bmsDev;
-                    bmsDev.name = pairedBmsName.c_str();
-                    bmsDev.address = NimBLEAddress(pairedBmsMac.c_str());
-                    connectToBms(bmsDev);
-                }
+            // K3: 如果正处于物理充电中且之前手动退出了充电大屏，按 K3 可再次进入全屏充电大屏
+            else if (key == KEY_EVENT_K3 && isBmsChargingCurrent()) {
+                Serial.println("[CHG] 用户在主桌面按 K3，重新进入全屏充电大屏");
+                currentState = STATE_CHARGING_DASH;
+                g_manualExitCharging = false;
+                chargeEnterTime = millis();
+                break;
             }
 
             drawMainDashboardUI();
@@ -2843,9 +3022,12 @@ void loop() {
 
         // ================= 步骤 2.2：独占全屏充电动画 =================
         case STATE_CHARGING_DASH: {
-            // 在充电大屏按 K3 可临时返回桌面
-            if (key == KEY_EVENT_K3) {
+            // 在充电大屏按任意按键退出回主仪表盘，并锁定避免再次弹回
+            if (key != KEY_EVENT_NONE) {
+                Serial.printf("[CHG] 用户在充电大屏按下按键 (Key=%d)，手动退出至主桌面！\n", key);
                 currentState = STATE_DASHBOARD_MAIN;
+                g_manualExitCharging = true;
+                break;
             }
             drawChargingUI();
             break;
@@ -2860,11 +3042,24 @@ void loop() {
             } else if (key == KEY_EVENT_K2) {
                 // 确认进入各真实子面板
                 switch (menuCursor) {
-                    case 0: // 清除本月大计
+                    case 0: // 释放保护板蓝牙
+                        Serial.println("[MENU] 用户选择: 释放保护板蓝牙给手机 App");
+                        if (pBmsClient && pBmsClient->isConnected()) {
+                            pBmsClient->disconnect();
+                        }
+                        carData.isLiveBms = false;
+                        currentState = STATE_BMS_RELEASED;
+                        break;
+                    case 1: // 清除本月大计
                         clearConfirmCursor = 0;
                         currentState = STATE_PANEL_CLEAR_MONTH;
                         break;
-                    case 1: // 重新连接保护板
+                    case 2: // 关闭屏幕显示
+                        Serial.println("[MENU] 用户选择: 关闭屏幕显示 (息屏待机)");
+                        currentState = STATE_SCREEN_OFF;
+                        turnScreenOff();
+                        break;
+                    case 3: // 重新连接保护板
                         prefs.remove("bms_mac");
                         prefs.remove("bms_name");
                         pairedBmsMac = "";
@@ -2875,13 +3070,13 @@ void loop() {
                         currentState = STATE_WIZARD_BMS;
                         startBleScan();
                         break;
-                    case 2: // 电池面板
+                    case 4: // 电池面板
                         currentState = STATE_PANEL_BATTERY;
                         break;
-                    case 3: // GPS 参数面板
+                    case 5: // GPS 参数面板
                         currentState = STATE_PANEL_GPS;
                         break;
-                    case 4: // 关于系统
+                    case 6: // 关于系统
                         currentState = STATE_PANEL_ABOUT;
                         break;
                 }
@@ -2957,6 +3152,38 @@ void loop() {
             }
             if (currentState == STATE_PANEL_ABOUT) {
                 drawAboutPanelUI();
+            }
+            break;
+        }
+
+        // ================= 步骤 5：释放保护板蓝牙给手机 App =================
+        case STATE_BMS_RELEASED: {
+            // 按任意按键 (K1, K2, K3, K4) 均退出释放模式并立即重新连接保护板
+            if (key != KEY_EVENT_NONE) {
+                Serial.printf("[BMS] 用户按下按键 (Key=%d)，退出释放模式，恢复保护板自动连接！\n", key);
+                currentState = STATE_DASHBOARD_MAIN;
+                if (!pairedBmsMac.isEmpty()) {
+                    BleDeviceItem bmsDev;
+                    bmsDev.name = pairedBmsName.c_str();
+                    bmsDev.address = NimBLEAddress(pairedBmsMac.c_str());
+                    connectToBms(bmsDev);
+                }
+                break;
+            }
+            drawBmsReleasedUI();
+            break;
+        }
+
+        // ================= 步骤 6：关闭屏幕显示 (息屏待机状态) =================
+        case STATE_SCREEN_OFF: {
+            // 息屏待机状态下：后台 GPS 航程积分、BMS 轮询保持运行
+            // 任意按键按下，立刻点亮唤醒屏幕并返回主仪表盘！
+            if (key != KEY_EVENT_NONE) {
+                Serial.printf("[DISPLAY] 任意物理按键按下 (Key=%d)，唤醒点亮屏幕！\n", key);
+                turnScreenOn();
+                currentState = STATE_DASHBOARD_MAIN;
+                drawMainDashboardUI();
+                break;
             }
             break;
         }
