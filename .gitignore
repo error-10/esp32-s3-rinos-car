@@ -9,6 +9,12 @@
 *.o
 *.d
 
+# Local recovery / debugging artifacts
+.backup_src/
+*.bak
+pio_run.log
+.tmp_*
+
 # OS generated files
 .DS_Store
 Thumbs.db

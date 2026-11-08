@@ -1,15 +1,18 @@
-# RinOS-Car: ESP32-S3 智能圆形车载液晶仪表盘系统
-注意：目前只支持蚂蚁保护板！！！
+# RinOS-Car：ESP32-S3 智能圆形车载液晶仪表盘
+
+> 当前固件版本：**v4.7**
+> 目前只支持**蚂蚁保护板**的 BLE 遥测协议。
 
 <div align="center">
 
 ![Platform](https://img.shields.io/badge/Platform-ESP32--S3-blue.svg)
 ![Framework](https://img.shields.io/badge/Framework-Arduino%20%2F%20PlatformIO-orange.svg)
 ![Screen](https://img.shields.io/badge/Screen-GC9A01%20240x240%20IPS-green.svg)
+![Version](https://img.shields.io/badge/Version-v4.7-cyan.svg)
 ![License](https://img.shields.io/badge/License-MIT-purple.svg)
 
-**专为电摩量身打造的开源智能圆形彩色液晶仪表系统**  
-高精度 GPS/北斗测速 · 蓝牙 BMS 电池遥测
+**专为电摩打造的开源智能圆形彩色液晶仪表系统**
+高精度 GPS/北斗测速 · 蓝牙 BMS 电池遥测 · 情境化灵动数据
 
 **作者主页 / 博客**：[https://miqwq.com](https://miqwq.com)
 
@@ -17,105 +20,216 @@
 
 ---
 
+## ✨ 功能概览
 
+### 仪表与交互
 
-## 🛒 硬件清单与购买关键词推荐
+- 1.28 寸 GC9A01 240×240 圆形 IPS 屏，LovyanGFX 全屏 Sprite 渲染。
+- 4 键模拟 ADC 按键：K1/K4 切换上下副显，K2 确认/菜单，K3 返回。
+- 主表盘：速度弧、电量弧、速度/电量大字、GPS 信号、上下情境副显。
+- 功能菜单：全屏圆屏应用列表，支持上下滚动、进入/退出动画。
+- 功能页：电池遥测 3 页、GPS 遥测 3 页、充电大屏、蓝牙释放、清除本月、灵动数据开关、关于。
+- 充电页以 SOC 为主视觉，显示端压、容量、功率、预计充满时间、压差、温度。
+- 支持息屏、K3 长按 5 秒紧急重启、K2 长按 1.8 秒重新配对。
 
-| 部件名称 | 推荐规格 / 芯片型号 | 作用 | 购买关键词（淘宝/拼多多/立创） | 预估参考价 |
+### 灵动数据
+
+主表盘上下副显不再固定，而是按骑行情境自动切换；K1/K4 手动切换后 8 秒恢复自动。
+
+**上副显优先级：**
+
+1. 手动选择（8 秒）
+2. 刚停车：TRIP
+3. 海拔持续上升/下降：海拔
+4. 驻车：时间
+5. 骑行中：TRIP / MONTH / 时间 / 海拔轮换
+
+**下副显优先级：**
+
+1. 手动选择（8 秒）
+2. 停车：剩余容量
+3. 大功率或功率快速变化：功率
+4. 骑行中：容量 / 功率 / 压差温度健康 / BMS 状态轮换
+
+可在功能菜单的“灵动数据开关”中关闭自动切换。
+
+### GPS / 北斗
+
+- ATGM336H / AT6558，Serial1 115200，10Hz 输出。
+- RMC 速度 5 帧中位数 + EMA 滤波，低速死区处理。
+- TRIP / MONTH 里程积分，跨月自动清零并写 NVS。
+- GGA 卫星数/海拔，GSV 载噪比/可见卫星统计。
+- 失锁 3 秒清速度与旧定位数据；重新定位时重置速度滤波窗口。
+- 跨月判断使用连续 3 帧确认，避免 GPS 日期跳变误清里程。
+
+### BMS 蓝牙遥测
+
+- NimBLE-Arduino 低功耗蓝牙，支持蚂蚁保护板新/旧协议解析。
+- 总压、电流、SOC、SOH、容量、温度、压差、单体电压、充电 MOS 状态。
+- 扫描结果使用 POD 环形队列交给主循环，避免 BLE 回调临界区堆操作。
+- 自动重连后台任务化，不阻塞主循环；连接成功后校验 Notify 特征并订阅。
+- BMS 数据 5 秒新鲜度检查，8 秒无包主动断开重连。
+- 只有确认可订阅 Notify 后才写入配对信息，避免坏 MAC 污染 NVS。
+- 息屏期间仍保持 BMS 轮询与后台重连。
+
+### 数据持久化
+
+NVS namespace：`rin_os`
+
+| Key | 类型 | 说明 |
+| :--- | :--- | :--- |
+| `month_odo` | float | 本月累计里程（km） |
+| `month_ym` | uint | 当前月份（YYYYMM） |
+| `bms_name` | string | 已配对保护板名称 |
+| `bms_mac` | string | 已配对保护板 MAC |
+| `smart_data` | bool | 灵动数据开关 |
+
+---
+
+## 🛒 硬件清单与购买关键词
+
+| 部件名称 | 推荐规格 / 芯片型号 | 作用 | 购买关键词 | 参考价 |
 | :--- | :--- | :--- | :--- | :--- |
-| **主控开发板** | **ESP32-S3-DevKitC-1** (N8 / 8MB Flash，无 PSRAM 即可) | 核心主控，负责蓝牙、GPS 解析、UI 渲染 | `ESP32-S3 开发板 N8` 或 `ESP32-S3 DevKitC-1` | ￥18 ~ ￥25 |
-| **圆形彩屏** | **1.28 寸 GC9A01 圆形 IPS 模块** (240x240 分辨率，SPI 接口，8P 排针) | 仪表盘高清显示，全贴合高透视角度 | `GC9A01 圆屏 1.28寸 SPI` 或 `240*240 圆形彩屏` | ￥15 ~ ￥22 |
-| **卫星定位模块** | **ATGM336H 成品模块 + 陶瓷天线** (已焊好 5P 排针，带陶瓷天线) | 北斗+GPS 双模卫星定位测速 | `ATGM336H 双模模块+天线 已焊排针` | ￥15 ~ ￥19 |
-| **按键模块** | **4 位模拟量 AD 按键模块** (3 线制：VCC, GND, OUT/AD) | 仪表菜单切页、里程清零等交互 | `4位 AD按键模块` 或 `单总线电阻梯按键` | ￥3 ~ ￥6 | |
-| **杜邦线 / 导线** | 20cm 母对母 / 公对母杜邦线、热缩管 | 电路连接与绝缘加固 | `杜邦线 20cm`、`绝缘热缩管` | ￥3 ~ ￥5 |
+| **主控开发板** | **ESP32-S3-DevKitC-1**（N8 / 8MB Flash，无 PSRAM 即可） | 蓝牙、GPS 解析、UI 渲染 | `ESP32-S3 开发板 N8` | ￥18 ~ ￥25 |
+| **圆形彩屏** | **1.28 寸 GC9A01 圆形 IPS**（240×240，SPI，8P） | 仪表显示 | `GC9A01 圆屏 1.28寸 SPI` | ￥15 ~ ￥22 |
+| **卫星定位模块** | **ATGM336H**（成品模块 + 陶瓷天线） | GPS/北斗定位测速 | `ATGM336H 双模模块+天线` | ￥15 ~ ￥19 |
+| **按键模块** | **4 位模拟量 AD 按键**（VCC/GND/OUT） | 菜单与页面交互 | `4位 AD按键模块` | ￥3 ~ ￥6 |
+| **杜邦线 / 热缩管** | 20cm 母对母、公对母 | 接线与绝缘 | `杜邦线 20cm` | ￥3 ~ ￥5 |
 
 > [!IMPORTANT]
-> **关于 GPS 天线选购**：
-> 购买 ATGM336H 时**务必勾选带天线的套餐**（不要只买单板）！推荐搭配 $18\times 18\text{mm}$ 或 $25\times 25\text{mm}$ 方形陶瓷天线，陶瓷面朝天安装，搜星速度与抗干扰能力最佳。
+> 购买 ATGM336H 时务必选择**带陶瓷天线的套餐**。推荐 18×18mm 或 25×25mm 方形陶瓷天线，陶瓷面朝天安装，搜星与抗干扰效果最好。
 
 ---
 
-## 🔌 硬件接线引脚对照表 (Wiring Pinout)
+## 🔌 接线引脚
 
-### 1. GC9A01 圆形显示屏 (SPI 接口)
-| 屏幕引脚标注 | 对应 ESP32-S3 引脚 | 说明 |
+### 1. GC9A01 圆形屏（SPI）
+
+| 屏幕引脚 | ESP32-S3 | 说明 |
 | :--- | :--- | :--- |
-| **SCL** (或 CLK) | **GPIO 12** | SPI 时钟线 (SCLK) |
-| **SDA** (或 MOSI/DIN) | **GPIO 11** | SPI 数据输出线 (MOSI) |
-| **DC** (或 RS) | **GPIO 9** | 数据 / 命令选择线 |
-| **CS** | **GPIO 10** | 片选引脚 |
-| **RES** (或 RST) | **GPIO 13** | 复位引脚 |
-| **BLK** (或 LED) | **3.3V** | 背光常亮 (也可悬空或接 3.3V) |
-| **VCC** | **3.3V** (或 5V) | 电源正极 |
+| **SCL / CLK** | **GPIO 12** | SPI 时钟 |
+| **SDA / MOSI / DIN** | **GPIO 11** | SPI 数据 |
+| **DC / RS** | **GPIO 9** | 数据/命令选择 |
+| **CS** | **GPIO 10** | 片选 |
+| **RES / RST** | **GPIO 13** | 复位 |
+| **BLK / LED** | **3.3V** | 背光常亮 |
+| **VCC** | **3.3V**（或 5V） | 电源正 |
+| **GND** | **GND** | 电源地 |
+
+### 2. ATGM336H GPS/北斗（UART）
+
+| GPS 引脚 | ESP32-S3 | 说明 |
+| :--- | :--- | :--- |
+| **TX** | **GPIO 17** | GPS 发送 → ESP32 RX1 |
+| **RX** | **GPIO 18** | ESP32 TX1 → GPS 接收配置命令 |
+| **VCC** | **3.3V** | 模块电源，严禁超过 3.6V（未加 LDO 时） |
+| **GND** | **GND** | 电源地 |
+| **PPS** | 悬空 | 1Hz 秒脉冲，不使用 |
+
+### 3. 4 位 AD 按键模块
+
+| 按键模块 | ESP32-S3 | 说明 |
+| :--- | :--- | :--- |
+| **OUT / AD** | **GPIO 8** | ADC1 模拟电压采样 |
+| **VCC** | **3.3V** | 上拉基准 |
 | **GND** | **GND** | 电源地 |
 
 ---
 
-### 2. ATGM336H GPS/北斗模块 (UART 交叉串口)
-| GPS 模块引脚 | 对应 ESP32-S3 引脚 | 说明 |
-| :--- | :--- | :--- |
-| **TX** (或 TXD) | **GPIO 17** | GPS 发送 $\to$ ESP32 接收 (RX1) |
-| **RX** (或 RXD) | **GPIO 18** | ESP32 发送 (TX1) $\to$ GPS 接收配置命令 |
-| **VCC** | **3.3V** | 模块电源（严禁超过 3.6V 如果未经过 LDO） |
-| **GND** | **GND** | 电源地 |
-| **PPS** | 悬空 | 1Hz 秒脉冲指示（不用接） |
+## 🚀 编译与刷机
 
----
+项目基于 **PlatformIO + Arduino**，依赖已在 `platformio.ini` 中配置。
 
-### 3. 4 位 AD 按键模块 (模拟分压)
-| 按键模块引脚 | 对应 ESP32-S3 引脚 | 说明 |
-| :--- | :--- | :--- |
-| **OUT / AD** | **GPIO 8** | 模拟电压采样引脚 (ADC1) |
-| **VCC** | **3.3V** | 按键上拉基准电源 |
-| **GND** | **GND** | 电源地 |
-
----
-
-## 🚀 快速上手与刷机指南
-
-本项目基于标准的 **PlatformIO** 开发环境，所有第三方库均已在 `platformio.ini` 中配置好自动化依赖管理，任何人下载源码后均可**一键编译、一键上传**。
-
-### 方法一：VS Code + PlatformIO 插件（最推荐）
-
-1. 在电脑上安装 [VS Code](https://code.visualstudio.com/)。
-2. 在 VS Code 扩展商店中搜索并安装 **PlatformIO IDE** 插件。
-3. 克隆或下载本仓库：
-   ```bash
-   git clone https://github.com/error-10/esp32-s3-rinos-car.git
-   ```
-4. 在 VS Code 中点击 `File` $\to$ `Open Folder...`，直接打开解压后的 `esp32-s3-rinos-car` 根目录。
-5. 用 Type-C 数据线将 ESP32-S3 开发板连接到电脑。
-6. 点击 VS Code 底部状态栏的 **对勾图标 (Build)** 编译，或点击 **向右箭头图标 (Upload)** 一键刷入！
-
----
-
-### 方法二：命令行一键编译上传
-
-如果你习惯使用命令行或终端：
+### 编译
 
 ```powershell
-# 1. 编译固件
 pio run
+```
 
-# 2. 编译并烧录至 ESP32-S3
+当前 v4.7 构建结果：
+
+- RAM：34,604 / 327,680（10.6%）
+- Flash：2,238,181 / 3,342,336（67.0%）
+
+### 电脑 USB 刷写（推荐）
+
+```powershell
+# 编译并烧录
 pio run -t upload
 
-# 3. 打开串口监视器查看实时调试信息
+# 串口监视
 pio device monitor -b 115200
+```
+
+### 整包刷写
+
+`.pio/build/esp32-s3-devkitc-1/firmware_full.bin` 是 ESP32-S3 整包，包含：
+
+| 偏移 | 内容 |
+| :--- | :--- |
+| `0x0` | bootloader |
+| `0x8000` | partition table |
+| `0xe000` | boot_app0 |
+| `0x10000` | application |
+
+> [!WARNING]
+> 整包从 `0x0` 刷写会覆盖 NVS，导致保护板配对、本月里程、灵动数据开关丢失。
+> 如需保留数据，只刷 `firmware.bin` 到 `0x10000`；或刷完整包后重新配对保护板并设置里程。
+
+> [!NOTE]
+> 推荐使用电脑 USB 刷写。部分手机 OTG 工具在刷整包时可能因线材、供电或工具兼容性导致 boot loop；如遇黑屏，优先改用电脑 `pio run -t upload` 恢复。
+
+---
+
+## 🖥️ PC 模拟器（开发预览）
+
+`sim/` 是独立的 Windows SDL2 预览程序，复用固件真实 UI 绘制代码，不接 ESP32、GPS、保护板。
+
+- 启动：双击 `sim\run_sim.cmd`，或运行 `sim\build\Release\rin_sim.exe`
+- 窗口：240×240，2× 缩放（496×519 外框）
+- 键位：
+  - ↑ = K1，↓ = K4，→ = K2，← = K3
+  - F1 = 配网向导
+  - F2 = 充电大屏
+  - F3 = 蓝牙释放页
+- 模拟器只用于 UI 调试，不代表实机 GPIO / BLE / GPS 行为。
+
+详细说明见 [`sim/README.md`](sim/README.md)。
+
+---
+
+## 📁 目录结构
+
+```text
+.
+├── src/
+│   └── main.cpp          # 固件主程序（UI、GPS、BMS、状态机）
+├── sim/                  # Windows SDL2 交互预览（非固件）
+├── platformio.ini        # PlatformIO 配置
+├── README.md
+├── CHANGELOG.md
+└── LICENSE
 ```
 
 ---
 
-## 📦 依赖库列表 (已在 platformio.ini 自动集成)
+## 📝 更新日志
 
-- [LovyanGFX](https://github.com/lovyan03/LovyanGFX) `@ ^1.2.30`：极其强大的 ESP32 跨平台高性能图形渲染驱动，支持 DMA 与超高速局部刷新。
-- [NimBLE-Arduino](https://github.com/h2zero/NimBLE-Arduino) `@ ^1.4.3`：比原版 Bluedroid 节省 60% 内存的超轻量蓝牙协议栈。
-- [Preferences](https://github.com/espressif/arduino-esp32) `@ ^2.0.0`：断电保存历史里程与累计统计。
+完整版本记录见 [`CHANGELOG.md`](CHANGELOG.md)。
+
+当前版本 **v4.7** 的主要变化：
+
+- 统一圆屏视觉体系：菜单、电池遥测、GPS 遥测、充电、蓝牙释放、关于、清除本月。
+- 新增灵动数据：上下副显按停车/骑行/海拔/功率情境自动切换。
+- 新增灵动数据开关页。
+- BMS 扫描队列、地址字节序、订阅校验、后台重连、数据新鲜度修复。
+- GPS 失锁滤波重置、跨月 3 帧确认、时间校验、NMEA 溢出统计。
+- 修复配网扫描启动失败、蓝牙释放页文字错位、充电页排版等问题。
 
 ---
 
 ## 📄 开源许可证
 
-本项目遵循 [MIT License](LICENSE) 开源许可协议。欢迎个人 DIY、车友改装交流与二次开发。
+本项目遵循 [MIT License](LICENSE)。欢迎个人 DIY、车友改装交流与二次开发。
 
 **官方网站与技术博客**：[https://miqwq.com](https://miqwq.com)

@@ -1,0 +1,5 @@
+build/
+*.png
+*.log
+*.err
+*.out
